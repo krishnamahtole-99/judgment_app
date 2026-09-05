@@ -32,6 +32,7 @@ class JudgmentSchema(BaseModel):
     headnotes: list[str] = Field(default_factory=list)
     law_points: list[str] = Field(default_factory=list)
     cases_referred: list[str] = Field(default_factory=list)
+    advocates: list[str] = Field(default_factory=list)
     advocates_block: str = ""
     judgment_body: list[JudgmentBlock] = Field(default_factory=list)
 
@@ -211,7 +212,7 @@ def parse_judgment_text_locally(text: str) -> JudgmentSchema:
             judgment_date = f"Decided on {d_m.group(1).strip().title()}"
             break
 
-    # 6. Extract Parties (Appellant vs Respondent)
+    # 6. Extract Parties safely
     versus_idx = -1
     for idx, line in enumerate(lines[:55]):
         if re.fullmatch(r"versus|vs\.?", line, re.I):
@@ -225,7 +226,11 @@ def parse_judgment_text_locally(text: str) -> JudgmentSchema:
             line = lines[idx]
             if re.search(r"\b(?:court|bench|criminal|application|appeal|petition|in revn|no\.|with|before)\b", line, re.I):
                 continue
-            if re.search(r"^(?:age|occu|r/o|flat|plot|\.\.\.)\b", line, re.I):
+            if re.search(r"^(?:age|occu|r/o|flat|plot)\b", line, re.I):
+                continue
+            if re.search(r"\b(?:applicant|appellant|petitioner)s?\b", line, re.I):
+                continue
+            if re.match(r"^[\.\-\s_]+$", line):
                 continue
             appellant = re.sub(r"(?i)\s*[-–]?\s*(?:applicant|appellant|petitioner)s?$", "", line).strip().title()
             break
@@ -234,13 +239,22 @@ def parse_judgment_text_locally(text: str) -> JudgmentSchema:
             line = lines[idx]
             if re.match(r"^\d+\.?$", line):
                 continue
-            if re.search(r"^(?:age|occu|r/o|flat|plot|\.\.\.)\b", line, re.I):
+            if re.search(r"^(?:age|occu|r/o|flat|plot)\b", line, re.I):
+                continue
+            if re.search(r"\b(?:respondent|opposite party)s?\b", line, re.I):
+                continue
+            if re.match(r"^[\.\-\s_]+$", line):
                 continue
             if "state" in line.lower():
                 respondent = "State of Maharashtra & Ors."
             else:
                 respondent = re.sub(r"(?i)\s*[-–]?\s*(?:respondent|opposite party)s?$", "", line).strip().title()
             break
+
+    if not appellant:
+        appellant = "Appellant / Applicant"
+    if not respondent:
+        respondent = "Respondents"
 
     # 7. Construct Case Details Box
     case_details = ""
@@ -370,6 +384,7 @@ def parse_judgment_text_locally(text: str) -> JudgmentSchema:
         headnotes=[headnote] if headnote else [],
         law_points=[law_point] if law_point else [],
         cases_referred=cases_referred,
+        advocates=advocates_found,
         advocates_block=advocates_block,
         judgment_body=judgment_body,
     )
