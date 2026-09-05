@@ -1,294 +1,101 @@
-"""Generate legal Word documents matching law report publication standards:
-- Narrow margins (0.5 in / 36 pt on all sides)
-- Subject / Catchwords Title at top (Book Antiqua 12 B, Center)
-- Journal header (Book Antiqua 10 Italic, Center)
-- Standardized Court Name (e.g. BOMBAY HIGH COURT) & Bench (e.g. (Aurangabad Bench))
-- Coram directly under Bench (e.g. (ABHAY S. WAGHWASE, J.))
-- Parties in Title Case with '- Applicant' and '- Respondents'
-- Bordered case details block (Appeal number, connected applications, Decided on date)
-- HeadNote block (Book Antiqua 11 B, Spacing Before: 7 pt, After: 4 pt)
-- Law Point block (Book Antiqua 12 B, Spacing Before: 3.6 pt, After: 4.3 pt)
-- List of Cases Referred (Heading: Minion Pro 11.5 BU; Cases: Minion Pro 11.5, Left: 0.4 cm)
-- Advocates Appeared for the Parties (Book Antiqua 10.5 Italic, Left: 0.21 cm)
-- Clean JUDGMENT heading (no duplicate judge names or labels)
-- Decimal numbered paragraphs: 0 tab spacing, Para Number: Book Antiqua 11 B
-- Sub-paragraphs strictly split and indented with 1 tab spacing (0.5 inch / first-line indent)
-- Blockquotes indented (Left: 1.0 in, Right: 0.5 in, Italic)
-- ORDER centered with 0 indent, and Roman numeral order items with 1 tab spacing (0.5 in)
-"""
-from __future__ import annotations
-
+import os
 from io import BytesIO
-import re
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches, Pt, Cm
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from parser_ai import JudgmentSchema, JudgmentBlock, has_devanagari
 
+import pdfplumber
+import streamlit as st
 
-def _apply_font(run, font_name: str, size: float, bold: bool = False, italic: bool = False, underline: bool = False):
-    run.font.name = font_name
-    run.font.size = Pt(size)
-    run.bold = bold
-    run.italic = italic
-    run.underline = underline
-    rPr = run._r.get_or_add_rPr()
-    rFonts = OxmlElement('w:rFonts')
-    rFonts.set(qn('w:ascii'), font_name)
-    rFonts.set(qn('w:hAnsi'), font_name)
-    rFonts.set(qn('w:cs'), font_name)
-    rPr.append(rFonts)
+from parser_ai import parse_judgment_text
+from docx_generator import generate_docx
 
+st.set_page_config(page_title="Indian Judgment to Word", page_icon="⚖", layout="centered")
+st.title("Indian Judgment to Word")
+st.caption("Converts court judgment PDFs into legally formatted Microsoft Word (.docx) files according to exact legal styling rules.")
 
-def add_top_and_bottom_borders(paragraph):
-    """Add clean single borders to top and bottom of the case details box."""
-    pPr = paragraph._p.get_or_add_pPr()
-    pBdr = OxmlElement('w:pBdr')
-    for side in ('top', 'bottom'):
-        bdr = OxmlElement(f'w:{side}')
-        bdr.set(qn('w:val'), 'single')
-        bdr.set(qn('w:sz'), '6')
-        bdr.set(qn('w:space'), '6')
-        bdr.set(qn('w:color'), 'auto')
-        pBdr.append(bdr)
-    pPr.append(pBdr)
+GEMINI_MODELS = {
+    "Gemini 3.6 Flash": "gemini-3.6-flash",
+    "Gemini 3.5 Flash": "gemini-3.5-flash",
+    "Gemini 3.5 Pro": "gemini-3.5-pro",
+}
 
+with st.sidebar:
+    st.header("Settings")
+    google_api_key = st.text_input(
+        "Google Gemini API key",
+        value=os.getenv("GOOGLE_API_KEY", ""),
+        type="password",
+        help="Optional. Leave empty for local conversion on your device.",
+    )
+    configured_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+    model_names = list(GEMINI_MODELS)
+    selected_model_name = st.selectbox(
+        "Gemini model",
+        model_names,
+        index=(list(GEMINI_MODELS.values()).index(configured_model)
+               if configured_model in GEMINI_MODELS.values() else 0),
+        help="Choose which Gemini model parses the judgment when an API key is provided.",
+    )
+    selected_model = GEMINI_MODELS[selected_model_name]
+    font_size = st.number_input("Word body font size", min_value=9, max_value=16, value=12, step=1)
 
-def generate_docx(judgment: JudgmentSchema, font_size: int = 12) -> BytesIO:
-    doc = Document()
+uploaded_file = st.file_uploader("Upload a judgment PDF", type=["pdf"])
 
-    # Narrow margins (0.5 in / 36 pt on all sides)
-    section = doc.sections[0]
-    section.top_margin = Inches(0.5)
-    section.bottom_margin = Inches(0.5)
-    section.left_margin = Inches(0.5)
-    section.right_margin = Inches(0.5)
+if uploaded_file is not None:
+    try:
+        pdf_stream = BytesIO(uploaded_file.getvalue())
+        with pdfplumber.open(pdf_stream) as pdf:
+            extracted_text = "\n\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+    except Exception as exc:
+        st.error(f"Could not read this PDF: {exc}")
+        st.stop()
 
-    # 1. Subject / Catchwords Title
-    if judgment.subject_title:
-        p_subj = doc.add_paragraph()
-        p_subj.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_subj.paragraph_format.space_before = Pt(0)
-        p_subj.paragraph_format.space_after = Pt(2)
-        _apply_font(p_subj.add_run(judgment.subject_title.strip()), "Book Antiqua", font_size, bold=True)
+    if not extracted_text:
+        st.error("No selectable text was found. Please upload a searchable PDF or run OCR before uploading.")
+        st.stop()
 
-    # 2. Journal Header Block
-    p_hdr = doc.add_paragraph()
-    p_hdr.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p_hdr.paragraph_format.space_after = Pt(2)
-    _apply_font(p_hdr.add_run(judgment.journal_header or "(2026 Maharashtra e Journal)"), "Book Antiqua", 10, italic=True)
+    with st.expander("Extracted text preview"):
+        st.text(extracted_text[:3000])
 
-    # 3. Court Name
-    if judgment.court_name:
-        p_court = doc.add_paragraph()
-        p_court.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_court.paragraph_format.space_after = Pt(2)
-        _apply_font(p_court.add_run(judgment.court_name.upper()), "Book Antiqua", font_size, bold=True)
-
-    # 4. Bench
-    if judgment.bench:
-        p_bench = doc.add_paragraph()
-        p_bench.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_bench.paragraph_format.space_after = Pt(2)
-        bench_text = judgment.bench.strip()
-        if not bench_text.startswith("("):
-            bench_text = f"({bench_text})"
-        _apply_font(p_bench.add_run(bench_text), "Book Antiqua", font_size, bold=True)
-
-    # 5. Coram (Placed directly below Bench)
-    if judgment.coram:
-        p_coram = doc.add_paragraph()
-        p_coram.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_coram.paragraph_format.space_after = Pt(6)
-        coram_text = judgment.coram.strip()
-        if not coram_text.startswith("("):
-            coram_text = f"({coram_text})"
-        _apply_font(p_coram.add_run(coram_text), "Book Antiqua", font_size, bold=True)
-
-    # 6. Parties Block
-    if judgment.appellant:
-        p_app = doc.add_paragraph()
-        p_app.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_app.paragraph_format.space_after = Pt(2)
-        app_name = judgment.appellant.strip()
-        role = f" - {judgment.appellant_role}" if judgment.appellant_role else " - Applicant"
-        _apply_font(p_app.add_run(f"{app_name}{role}"), "Book Antiqua", font_size, bold=True)
-
-        p_vs = doc.add_paragraph()
-        p_vs.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_vs.paragraph_format.space_after = Pt(2)
-        _apply_font(p_vs.add_run("Versus"), "Book Antiqua", font_size, italic=True)
-
-    if judgment.respondent:
-        p_resp = doc.add_paragraph()
-        p_resp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_resp.paragraph_format.space_after = Pt(6)
-        resp_name = judgment.respondent.strip()
-        role = f" - {judgment.respondent_role}" if judgment.respondent_role else " - Respondents"
-        _apply_font(p_resp.add_run(f"{resp_name}{role}"), "Book Antiqua", font_size, bold=True)
-
-    # 7. Case Details Block (Bordered)
-    details_content = judgment.case_details.strip()
-    if not details_content:
-        parts = [p for p in [judgment.appeal_number, judgment.judgment_date] if p]
-        details_content = "   |   ".join(parts)
-
-    if details_content:
-        p_details = doc.add_paragraph()
-        p_details.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p_details.paragraph_format.space_before = Pt(3.6)
-        p_details.paragraph_format.space_after = Pt(2.2)
-        _apply_font(p_details.add_run(details_content), "Book Antiqua", 10.5, bold=False)
-        add_top_and_bottom_borders(p_details)
-
-    # 8. HeadNote
-    if judgment.headnotes:
-        for hn in judgment.headnotes:
-            is_mar = has_devanagari(hn)
-            p_hn = doc.add_paragraph()
-            p_hn.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            if is_mar:
-                p_hn.paragraph_format.space_after = Pt(10)
-                _apply_font(p_hn.add_run(hn.strip()), "Tiro Devanagari Marathi", 12)
+    if st.button("Convert to Word (.docx)", type="primary"):
+        progress_bar = st.progress(0, text="Starting conversion...")
+        with st.spinner("Applying legal rules, styles, margins, and paragraph formatting..."):
+            try:
+                progress_bar.progress(30, text="Parsing parties, citations, and numbered points...")
+                judgment = parse_judgment_text(
+                    extracted_text,
+                    api_key=google_api_key,
+                    model=selected_model,
+                )
+                
+                progress_bar.progress(70, text="Generating customized .docx with legal layout...")
+                docx_stream = generate_docx(judgment, font_size=int(font_size))
+                
+                progress_bar.progress(100, text="Ready!")
+            except Exception as exc:
+                progress_bar.empty()
+                st.error(f"Error during conversion: {exc}")
             else:
-                p_hn.paragraph_format.space_before = Pt(7)
-                p_hn.paragraph_format.space_after = Pt(4)
-                _apply_font(p_hn.add_run(hn.strip()), "Book Antiqua", 11, bold=True)
+                st.success("Document successfully formatted!")
+                st.subheader("Detected Case Metadata")
+                col1, col2 = st.columns(2)
+                with col1:
+                    topic = getattr(judgment, 'subject_title', '') or 'Not detected'
+                    applicant = getattr(judgment, 'appellant', '') or 'Not detected'
+                    respondent = getattr(judgment, 'respondent', '') or 'Not detected'
+                    bench = getattr(judgment, 'bench', '') or 'Not detected'
+                    st.write(f"• **Topic:** {topic}")
+                    st.write(f"• **Applicant:** {applicant}")
+                    st.write(f"• **Respondent:** {respondent}")
+                    st.write(f"• **Bench:** {bench}")
+                with col2:
+                    case_details = getattr(judgment, 'case_details', '') or 'Not detected'
+                    cases_ref = getattr(judgment, 'cases_referred', []) or []
+                    st.write(f"• **Case Details:** {case_details}")
+                    st.write(f"• **Cases Referred:** {len(cases_ref)} cited")
 
-    # 9. Law Point
-    if judgment.law_points:
-        p_lp_head = doc.add_paragraph()
-        p_lp_head.paragraph_format.space_before = Pt(3.6)
-        p_lp_head.paragraph_format.space_after = Pt(2)
-        _apply_font(p_lp_head.add_run("Law Point"), "Book Antiqua", font_size, bold=True)
-
-        for lp in judgment.law_points:
-            is_mar = has_devanagari(lp)
-            p_lp = doc.add_paragraph()
-            p_lp.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            if is_mar:
-                p_lp.paragraph_format.space_before = Pt(3.6)
-                p_lp.paragraph_format.space_after = Pt(4.3)
-                _apply_font(p_lp.add_run(lp.strip()), "Tiro Devanagari Marathi", 11, bold=True)
-            else:
-                p_lp.paragraph_format.space_before = Pt(2)
-                p_lp.paragraph_format.space_after = Pt(4.3)
-                _apply_font(p_lp.add_run(lp.strip()), "Book Antiqua", font_size, bold=True)
-
-    # 10. List of Cases Referred
-    if judgment.cases_referred:
-        p_cr_head = doc.add_paragraph()
-        p_cr_head.paragraph_format.space_before = Pt(6)
-        p_cr_head.paragraph_format.space_after = Pt(2)
-        _apply_font(p_cr_head.add_run("List of Cases Referred :"), "Minion Pro", 11.5, bold=True, underline=True)
-
-        for i, case in enumerate(judgment.cases_referred):
-            clean_case = re.sub(r"^\d+\.\s*", "", case.strip())
-            p_case = doc.add_paragraph()
-            p_case.paragraph_format.left_indent = Cm(0.4)
-            p_case.paragraph_format.space_before = Pt(2)
-            p_case.paragraph_format.space_after = Pt(2)
-            _apply_font(p_case.add_run(f"{i+1}. {clean_case}"), "Minion Pro", 11.5)
-
-    # 11. Advocates Block
-    if judgment.advocates_block:
-        p_adv = doc.add_paragraph()
-        p_adv.paragraph_format.left_indent = Cm(0.21)
-        p_adv.paragraph_format.space_before = Pt(5)
-        p_adv.paragraph_format.space_after = Pt(4.1)
-
-        adv_text = judgment.advocates_block.strip()
-        prefix = "Advocates Appeared for the Parties :- "
-        if adv_text.startswith(prefix):
-            _apply_font(p_adv.add_run(prefix), "Book Antiqua", 10.5, bold=True, italic=True)
-            _apply_font(p_adv.add_run(adv_text[len(prefix):]), "Book Antiqua", 10.5, italic=True)
-        else:
-            _apply_font(p_adv.add_run(prefix), "Book Antiqua", 10.5, bold=True, italic=True)
-            _apply_font(p_adv.add_run(adv_text), "Book Antiqua", 10.5, italic=True)
-
-    # 12. JUDGMENT Heading (Clean, single heading)
-    p_judg = doc.add_paragraph()
-    p_judg.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p_judg.paragraph_format.space_before = Pt(3.6)
-    p_judg.paragraph_format.space_after = Pt(3.6)
-    _apply_font(p_judg.add_run("JUDGMENT"), "Book Antiqua", font_size, bold=True)
-
-    # 13. Judgment Body Paragraphs
-    for block in judgment.judgment_body:
-        text = block.text.strip()
-        if not text:
-            continue
-
-        # Prevent duplicate headers
-        if re.fullmatch(r"JUDGMENT\s*:?", text, re.I) or re.match(r"^ABHAY S\. WAGHWASE.*", text, re.I):
-            continue
-
-        font_name = "Tiro Devanagari Marathi" if block.is_marathi else "Book Antiqua"
-
-        p = doc.add_paragraph()
-        p.paragraph_format.line_spacing = 1.15
-
-        # Standalone ORDER heading
-        if re.fullmatch(r"ORDER", text, re.I) or block.type == "order":
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.first_line_indent = Inches(0)
-            p.paragraph_format.left_indent = Inches(0)
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(6)
-            _apply_font(p.add_run(text), font_name, font_size, bold=True)
-            continue
-
-        # Divider
-        if block.type == "divider" or text == "-----------------------------":
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(6)
-            _apply_font(p.add_run("-----------------------------"), font_name, font_size)
-            continue
-
-        # Order items (I), (II), (III) -> 1 tab spacing (0.5 inch)
-        if block.type == "order_item" or re.match(r"^\([IVXLCDMivxlcdm]+\)", text):
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.left_indent = Inches(0)
-            p.paragraph_format.first_line_indent = Inches(0.5)
-            p.paragraph_format.space_after = Pt(5)
-            _apply_font(p.add_run(text), font_name, font_size)
-            continue
-
-        # Blockquotes (indented 1.0 inch left, 0.5 inch right)
-        if block.type == "blockquote" or text.startswith(('"', '“', '‘')):
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.left_indent = Inches(1.0)
-            p.paragraph_format.right_indent = Inches(0.5)
-            p.paragraph_format.first_line_indent = Inches(0)
-            p.paragraph_format.space_before = Pt(3)
-            p.paragraph_format.space_after = Pt(5)
-            _apply_font(p.add_run(text), font_name, font_size - 0.5, italic=True)
-            continue
-
-        # Decimal numbered paragraphs (1., 2., ...) -> 0 tab spacing, Para Number 11 B
-        dec_match = re.match(r"^(\d+(?:\.\d+)*[\.\)]\s*)(.*)", text, re.DOTALL)
-        if dec_match and block.type != "subparagraph":
-            prefix, body_text = dec_match.group(1), dec_match.group(2)
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.left_indent = Inches(0)
-            p.paragraph_format.first_line_indent = Inches(0)
-            p.paragraph_format.space_after = Pt(5)
-            _apply_font(p.add_run(prefix), font_name, 11, bold=True)
-            if body_text:
-                _apply_font(p.add_run(body_text), font_name, font_size)
-            continue
-
-        # Sub-paragraphs -> 1 tab spacing (0.5 inch / first-line indent)
-        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        p.paragraph_format.left_indent = Inches(0)
-        p.paragraph_format.first_line_indent = Inches(0.5)
-        p.paragraph_format.space_after = Pt(5)
-        _apply_font(p.add_run(text), font_name, font_size)
-
-    output = BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output
+                filename = f"{uploaded_file.name.rsplit('.', 1)[0]}_formatted.docx"
+                st.download_button(
+                    label="⬇ Download Formatted Word Document",
+                    data=docx_stream.getvalue(),
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
